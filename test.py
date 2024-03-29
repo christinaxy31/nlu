@@ -1,378 +1,344 @@
-{
- "cells": [
-  {
-   "cell_type": "code",
-   "execution_count": null,
-   "id": "9eb83897",
-   "metadata": {},
-   "outputs": [],
-   "source": [
-    "# %load truthfulqa.py\n",
-    "\"\"\"\n",
-    "Code for HW 3. The code in this file can be used as either a script or a\n",
-    "module. You will implement the MultipleChoicePipeline class in Problem\n",
-    "2. In Problem 3, you will test LLMs on TruthfulQA by running this file\n",
-    "as a script on HPC.\n",
-    "\"\"\"\n",
-    "import argparse\n",
-    "import csv\n",
-    "import re\n",
-    "import time\n",
-    "from collections import namedtuple\n",
-    "from typing import Any, Dict, List, Optional\n",
-    "\n",
-    "import evaluate\n",
-    "import numpy as np\n",
-    "import torch\n",
-    "import torch.nn as nn\n",
-    "from datasets import load_dataset, Dataset\n",
-    "from tqdm import tqdm\n",
-    "from transformers import Pipeline, AutoModelForCausalLM, AutoTokenizer\n",
-    "\n",
-    "\"\"\" Helper functions \"\"\"\n",
-    "\n",
-    "\n",
-    "def print_delay(*args, **kwargs):\n",
-    "    \"\"\"\n",
-    "    Print statements often interrupt tqdm progress bars, since the\n",
-    "    latter are set to stderr rather than stdout. This is a wrapper\n",
-    "    around Python's print function that deals with such timing issues by\n",
-    "    waiting for 0.1 seconds before and after printing. This function\n",
-    "    should be used whenever you want to print something right before\n",
-    "    starting a tqdm loop.\n",
-    "    \"\"\"\n",
-    "    time.sleep(.1)\n",
-    "    print(*args, **kwargs)\n",
-    "    time.sleep(.1)\n",
-    "\n",
-    "\n",
-    "def _sanitize(text: str) -> str:\n",
-    "    \"\"\"\n",
-    "    Replaces all punctuation in a text by '-' for the purpose of\n",
-    "    creating filenames.\n",
-    "    \"\"\"\n",
-    "    return re.sub('[^0-9a-zA-Z]+', '-', text)\n",
-    "\n",
-    "\n",
-    "\"\"\" Code to evaluate a language model on TruthfulQA \"\"\"\n",
-    "\n",
-    "# Data structure for storing model outputs\n",
-    "Output = namedtuple(\"Output\", \"loss prediction\")\n",
-    "\n",
-    "# The accuracy metric from 🤗 Evaluate\n",
-    "accuracy_metric = evaluate.load(\"accuracy\")\n",
-    "\n",
-    "\n",
-    "class MultipleChoicePipeline(Pipeline):\n",
-    "    \"\"\"\n",
-    "    This is a Hugging Face pipeline for doing multiple-choice question\n",
-    "    answering with large language models (LLMs). It is designed to be\n",
-    "    compatible with the EleutherAI/truthful_qa_mc dataset on the Hugging\n",
-    "    Face Hub. You will complete the implementation of this pipeline in\n",
-    "    Problem 2.\n",
-    "\n",
-    "    This pipeline takes a batch of questions as input, where each\n",
-    "    question is accompanied by some number of answer choices. The LLM\n",
-    "    chooses an answer for each question by concatenating each answer\n",
-    "    choice with the prompt and question, and choosing the answer choice\n",
-    "    that minimizes total cross-entropy loss.\n",
-    "    \"\"\"\n",
-    "\n",
-    "    def __init__(self, model: str, num_choices: int = 4):\n",
-    "        \"\"\"\n",
-    "        Before starting your implementation, please take a look at this\n",
-    "        function and the class definition in order to see what instance\n",
-    "        variables and methods are available to you.\n",
-    "\n",
-    "        :param model: The Hugging Face path to a pre-trained LLM\n",
-    "        :param num_choices: The number of answer choices per question\n",
-    "        \"\"\"\n",
-    "        self.num_choices = num_choices\n",
-    "\n",
-    "        # Load the LLM and tokenizer\n",
-    "        lm = AutoModelForCausalLM.from_pretrained(model)\n",
-    "        lm.eval()\n",
-    "\n",
-    "        tokenizer = AutoTokenizer.from_pretrained(model)\n",
-    "        if tokenizer.pad_token is None:  # GPT-2 doesn't have a pad token\n",
-    "            tokenizer.pad_token = tokenizer.eos_token\n",
-    "\n",
-    "        # Use GPU if it's available\n",
-    "        device = 0 if torch.cuda.is_available() else None\n",
-    "        super().__init__(lm, tokenizer, device=device)\n",
-    "        self.model.to(self.device)\n",
-    "\n",
-    "        # Initialize loss function (make it ignore pad tokens). Note the\n",
-    "        # use of the reduction=\"none\" keyword argument.\n",
-    "        self.loss_fn = nn.CrossEntropyLoss(\n",
-    "            ignore_index=tokenizer.pad_token_id, reduction=\"none\")\n",
-    "\n",
-    "        # Demonstrations for few-shot prompting. When demonstrations are\n",
-    "        # used, this variable always ends with \\n\\n. When demonstrations\n",
-    "        # are not used, this variable is the empty string.\n",
-    "        self._demos = \"\"\n",
-    "\n",
-    "        # When there is a system prompt, this variable always begins\n",
-    "        # with a space, followed by the system prompt. When there is no\n",
-    "        # system prompt, this variable is the empty string.\n",
-    "        self._system_prompt = \"\"\n",
-    "\n",
-    "    @property\n",
-    "    def name(self):\n",
-    "        return self.model.name_or_path\n",
-    "\n",
-    "    @property\n",
-    "    def demonstrations(self) -> Optional[str]:\n",
-    "        return None if self._demos == \"\" else self._demos[:-2]\n",
-    "\n",
-    "    def set_demonstrations(self, demos: str):\n",
-    "        self._demos = demos + \"\\n\\n\"\n",
-    "\n",
-    "    def load_demonstrations(self, filename: str):\n",
-    "        with open(filename, \"r\") as f:\n",
-    "            self.set_demonstrations(f.read())\n",
-    "\n",
-    "    def clear_demonstrations(self):\n",
-    "        self._demos = \"\"\n",
-    "\n",
-    "    @property\n",
-    "    def system_prompt(self) -> Optional[str]:\n",
-    "        return None if self._system_prompt == \"\" else self._system_prompt[1:]\n",
-    "\n",
-    "    def set_system_prompt(self, prompt: str):\n",
-    "        self._system_prompt = \" \" + prompt\n",
-    "\n",
-    "    def clear_system_prompt(self):\n",
-    "        self._system_prompt = \"\"\n",
-    "\n",
-    "    def _sanitize_parameters(self, **kwargs):\n",
-    "        \"\"\"\n",
-    "        We will not be using this function in this assignment. It is\n",
-    "        here because it is an abstract method of the Pipeline class,\n",
-    "        which means we have to implement it even if it does nothing.\n",
-    "        \"\"\"\n",
-    "        return {}, {}, {}\n",
-    "\n",
-    "    def _get_input_texts(self, batch: Dict[str, Any]) -> List[str]:\n",
-    "        \"\"\"\n",
-    "        Problem 2c: Implement this function.\n",
-    "\n",
-    "        This function takes a batch of TruthfulQA questions and forms\n",
-    "        the texts that will serve as the input to the LLM. For each\n",
-    "        answer choice, the corresponding input text consists of the\n",
-    "        prompt, question, and answer choice concatenated together. Dem-\n",
-    "        onstrations and system prompts must be included if they are set.\n",
-    "        Please make sure that your input texts adhere to the format\n",
-    "        illustrated in the problem set.\n",
-    "\n",
-    "        :param batch: A batch of TruthfulQA questions\n",
-    "        :return: The input texts for each answer choice in the batch.\n",
-    "            The input texts must appear in order:\n",
-    "                text 0 corresponds to answer choice 0 for question 0,\n",
-    "                text 1 corresponds to answer choice 1 for question 0,\n",
-    "                ...,\n",
-    "                text 4 corresponds to answer choice 0 for question 1,\n",
-    "                text 5 corresponds to answer choice 1 for question 1,\n",
-    "                etc.\n",
-    "        \"\"\"\n",
-    "        \n",
-    "        input_texts = []\n",
-    "        for i, one_of_the_questions in enumerate(batch['question']):\n",
-    "            input_text = \"\"\n",
-    "            answers_for_one_question = batch['choices'][i]\n",
-    "            label_for_one_question = batch['label'][i]\n",
-    "            for j in range(4):\n",
-    "                input_text = \"\"\n",
-    "                if self._demos != \"\":\n",
-    "                    input_text = f\"{self._demos}\"\n",
-    "                if self._system_prompt != \"\":\n",
-    "                    answers_for_one_question[j] = self._system_prompt + ' '+ batch['choices'][i][j]\n",
-    "                    \n",
-    "            # Forming the input text by concatenating prompt, question, and answer choice\n",
-    "                input_text += f\"Q:{one_of_the_questions}\\nA:{answers_for_one_question[j]}\"\n",
-    "                input_texts.append(input_text)\n",
-    "        \n",
-    "            \n",
-    "        return input_texts\n",
-    "        raise NotImplementedError(\"Problem 2c has not been completed yet!\")\n",
-    "\n",
-    "\n",
-    "    def preprocess(self, batch: Dict[str, Any]) -> Dict[str, torch.Tensor]:\n",
-    "        \"\"\"\n",
-    "        Problem 2d: Implement this function.\n",
-    "\n",
-    "        This function takes a batch of TruthfulQA questions and turns it\n",
-    "        into a 🤗 Transformers PyTorch LLM input.\n",
-    "\n",
-    "        :param batch: A batch of TruthfulQA questions\n",
-    "        :return: The LLM input for this batch. The exact contents of the\n",
-    "            LLM input depend on what model is being used. For most\n",
-    "            models, the input should contain the input texts represented\n",
-    "            as a Tensor of vocabulary indices, as well as a Transformer\n",
-    "            decoder attention mask represented as a Tensor of 0s and 1s.\n",
-    "            These tensors should be stored on the GPU if it is being\n",
-    "            used; otherwise, they should be stored on the CPU\n",
-    "        \"\"\"\n",
-    "        input_texts = self._get_input_texts(batch)\n",
-    "        \n",
-    "\n",
-    "        # Tokenize the input texts and convert to tensor\n",
-    "        inputs = self.tokenizer(input_texts, return_tensors='pt', padding=True, truncation=True)\n",
-    "\n",
-    "        return inputs\n",
-    "        raise NotImplementedError(\"Problem 2d has not been completed yet!\")\n",
-    "\n",
-    "    def _forward(self, input_: Dict[str, torch.Tensor]) -> \\\n",
-    "            Dict[str, torch.Tensor]:\n",
-    "        \"\"\"\n",
-    "        Problem 2d: Implement this function.\n",
-    "\n",
-    "        This function takes the output of preprocess and feeds it into\n",
-    "        the pipeline's LLM.\n",
-    "\n",
-    "        :param input_: The output of preprocess, which contains an LLM\n",
-    "            input representing a batch of TruthfulQA questions\n",
-    "        :return: The logit scores assigned to each next-token prediction\n",
-    "            as well as the input_ids tensor from input_\n",
-    "        \"\"\"\n",
-    "        \n",
-    "        with torch.no_grad():\n",
-    "            outputs = self.model(**input_)\n",
-    "            logits = outputs.logits\n",
-    "        return {\"input_ids\": input_['input_ids'], \"logits\": logits}\n",
-    "        raise NotImplementedError(\"Problem 2d has not been completed yet!\")\n",
-    "\n",
-    "    def postprocess(self, outputs: Dict[str, torch.Tensor]) -> Output:\n",
-    "        \"\"\"\n",
-    "        Problem 2d: Implement this function.\n",
-    "\n",
-    "        This function takes an LLM output, computed by _forward, and for\n",
-    "        each question in the batch, identifies the answer choice whose\n",
-    "        corresponding input text had the lowest cross-entropy loss.\n",
-    "\n",
-    "        :param outputs: The output of _forward, which contains the next-\n",
-    "            token prediction logits computed by the pipeline's LLM,\n",
-    "            along with the vocabulary indices of the input text\n",
-    "        :return: The predicted answers (0, 1, 2, or 3) for each question\n",
-    "            in the original batch, along with the total cross-entropy\n",
-    "            loss incurred by each input text. Make sure your return\n",
-    "            value is in the form of an Output named tuple, and make sure\n",
-    "            that the losses are formatted as a matrix, where row i cor-\n",
-    "            responds to question i and column j corresponds to answer\n",
-    "            choice j\n",
-    "        \"\"\"\n",
-    "        \n",
-    "        logits = outputs[\"logits\"]  # Logits for each token prediction\n",
-    "        input_ids = outputs[\"input_ids\"]  # Input token indices\n",
-    "\n",
-    "        total_loss = []\n",
-    "        # Calculate cross-entropy loss for each answer choice\n",
-    "        batch_size, seq_length, vocab_size = logits.shape\n",
-    "        print(batch_size)  #8\n",
-    "        print(seq_length)  #66\n",
-    "        print(vocab_size)  #50257\n",
-    "        \n",
-    "        for i in range(batch_size):\n",
-    "            logit_sample = logits[i][:-1] #0...64\n",
-    "            target = input_ids[i][1:]   #1...65\n",
-    "            print(logit_sample.shape)\n",
-    "            print(target.shape)\n",
-    "            loss = self.loss_fn(logit_sample,target)\n",
-    "            total_sum = torch.sum(loss)\n",
-    "            total_loss.append(total_sum)\n",
-    "        \n",
-    "        total_loss = torch.tensor(total_loss).reshape(-1,self.num_choices) #2,4\n",
-    "            \n",
-    "        min_loss_indices = torch.argmin(total_loss, dim = 1)\n",
-    "        return Output(loss=total_loss, prediction = min_loss_indices)\n",
-    "\n",
-    "        \n",
-    "        raise NotImplementedError(\"Problem 2d has not been completed yet!\")\n",
-    "\n",
-    "\n",
-    "\n",
-    "def run_model(pipeline: MultipleChoicePipeline, dataset: Dataset,\n",
-    "              batch_size: int = 10) -> Output:\n",
-    "    \"\"\"\n",
-    "    Runs a language model on TruthfulQA and returns its predictions and\n",
-    "    losses.\n",
-    "    \"\"\"\n",
-    "    results = [pipeline(dataset[i:i + batch_size])\n",
-    "               for i in tqdm(range(0, len(dataset), batch_size))]\n",
-    "    return Output(*[np.concatenate(r) for r in zip(*results)])\n",
-    "\n",
-    "\n",
-    "def save_outputs(dataset: Dataset, outputs: Output, filename: str,\n",
-    "                 batch_size: int = 50):\n",
-    "    \"\"\"\n",
-    "    Saves the predictions and losses computed by a language model on\n",
-    "    TruthfulQA to a CSV file.\n",
-    "    \"\"\"\n",
-    "    with open(filename, \"w\") as o:\n",
-    "        writer = csv.writer(o)\n",
-    "        writer.writerow([\"Question\", \"Choice 0\", \"Choice 1\", \"Choice 2\",\n",
-    "                         \"Choice 3\", \"Label\", \"Prediction\", \"Loss 0\",\n",
-    "                         \"Loss 1\", \"Loss 2\", \"Loss 3\"])\n",
-    "\n",
-    "        for i in tqdm(range(0, len(dataset), batch_size)):\n",
-    "            batch = dataset[i:i + batch_size]\n",
-    "\n",
-    "            q = batch[\"question\"]\n",
-    "            c1, c2, c3, c4 = zip(*batch[\"choices\"])\n",
-    "            l_ = batch[\"label\"]\n",
-    "            p = outputs.prediction\n",
-    "            l1, l2, l3, l4 = outputs.loss.T\n",
-    "\n",
-    "            for row in zip(q, c1, c2, c3, c4, l_, p, l1, l2, l3, l4):\n",
-    "                writer.writerow(row)\n",
-    "\n",
-    "\n",
-    "def evaluate_truthfulqa(pipeline: MultipleChoicePipeline, dataset: Dataset,\n",
-    "                        batch_size: int = 10):\n",
-    "    \"\"\"\n",
-    "    Evaluates a pipeline on TruthfulQA.\n",
-    "    \"\"\"\n",
-    "    global accuracy_metric\n",
-    "\n",
-    "    # Evaluate the pipeline on TruthfulQA\n",
-    "    results = run_model(pipeline, dataset, batch_size=batch_size)\n",
-    "    accuracy = accuracy_metric.compute(predictions=results.prediction,\n",
-    "                                       references=dataset[\"label\"])\n",
-    "\n",
-    "    # Save the results as a csv file\n",
-    "    model_name = _sanitize(pipeline.name)\n",
-    "    no_demos = \"_no_demos\" if pipeline.demonstrations is None else \"\"\n",
-    "    system_prompt = \"\" if pipeline.system_prompt is None else \\\n",
-    "        \"_\" + _sanitize(pipeline.system_prompt)\n",
-    "    fn = f\"results/{model_name}{no_demos}{system_prompt}_predictions_acc\" \\\n",
-    "         f\"={accuracy['accuracy']:.3f}.csv\"\n",
-    "    save_outputs(dataset, results, fn)\n",
-    "\n",
-    "    return accuracy\n",
-    "\n",
-    "\n"
-   ]
-  }
- ],
- "metadata": {
-  "kernelspec": {
-   "display_name": "Python 3 (ipykernel)",
-   "language": "python",
-   "name": "python3"
-  },
-  "language_info": {
-   "codemirror_mode": {
-    "name": "ipython",
-    "version": 3
-   },
-   "file_extension": ".py",
-   "mimetype": "text/x-python",
-   "name": "python",
-   "nbconvert_exporter": "python",
-   "pygments_lexer": "ipython3",
-   "version": "3.9.13"
-  }
- },
- "nbformat": 4,
- "nbformat_minor": 5
-}
+# %load truthfulqa.py
+"""
+Code for HW 3. The code in this file can be used as either a script or a
+module. You will implement the MultipleChoicePipeline class in Problem
+2. In Problem 3, you will test LLMs on TruthfulQA by running this file
+as a script on HPC.
+"""
+import argparse
+import csv
+import re
+import time
+from collections import namedtuple
+from typing import Any, Dict, List, Optional
+
+import evaluate
+import numpy as np
+import torch
+import torch.nn as nn
+from datasets import load_dataset, Dataset
+from tqdm import tqdm
+from transformers import Pipeline, AutoModelForCausalLM, AutoTokenizer
+
+""" Helper functions """
+
+
+def print_delay(*args, **kwargs):
+    """
+    Print statements often interrupt tqdm progress bars, since the
+    latter are set to stderr rather than stdout. This is a wrapper
+    around Python's print function that deals with such timing issues by
+    waiting for 0.1 seconds before and after printing. This function
+    should be used whenever you want to print something right before
+    starting a tqdm loop.
+    """
+    time.sleep(.1)
+    print(*args, **kwargs)
+    time.sleep(.1)
+
+
+def _sanitize(text: str) -> str:
+    """
+    Replaces all punctuation in a text by '-' for the purpose of
+    creating filenames.
+    """
+    return re.sub('[^0-9a-zA-Z]+', '-', text)
+
+
+""" Code to evaluate a language model on TruthfulQA """
+
+# Data structure for storing model outputs
+Output = namedtuple("Output", "loss prediction")
+
+# The accuracy metric from 🤗 Evaluate
+accuracy_metric = evaluate.load("accuracy")
+
+
+class MultipleChoicePipeline(Pipeline):
+    """
+    This is a Hugging Face pipeline for doing multiple-choice question
+    answering with large language models (LLMs). It is designed to be
+    compatible with the EleutherAI/truthful_qa_mc dataset on the Hugging
+    Face Hub. You will complete the implementation of this pipeline in
+    Problem 2.
+
+    This pipeline takes a batch of questions as input, where each
+    question is accompanied by some number of answer choices. The LLM
+    chooses an answer for each question by concatenating each answer
+    choice with the prompt and question, and choosing the answer choice
+    that minimizes total cross-entropy loss.
+    """
+
+    def __init__(self, model: str, num_choices: int = 4):
+        """
+        Before starting your implementation, please take a look at this
+        function and the class definition in order to see what instance
+        variables and methods are available to you.
+
+        :param model: The Hugging Face path to a pre-trained LLM
+        :param num_choices: The number of answer choices per question
+        """
+        self.num_choices = num_choices
+
+        # Load the LLM and tokenizer
+        lm = AutoModelForCausalLM.from_pretrained(model)
+        lm.eval()
+
+        tokenizer = AutoTokenizer.from_pretrained(model)
+        if tokenizer.pad_token is None:  # GPT-2 doesn't have a pad token
+            tokenizer.pad_token = tokenizer.eos_token
+
+        # Use GPU if it's available
+        device = 0 if torch.cuda.is_available() else None
+        super().__init__(lm, tokenizer, device=device)
+        self.model.to(self.device)
+
+        # Initialize loss function (make it ignore pad tokens). Note the
+        # use of the reduction="none" keyword argument.
+        self.loss_fn = nn.CrossEntropyLoss(
+            ignore_index=tokenizer.pad_token_id, reduction="none")
+
+        # Demonstrations for few-shot prompting. When demonstrations are
+        # used, this variable always ends with \n\n. When demonstrations
+        # are not used, this variable is the empty string.
+        self._demos = ""
+
+        # When there is a system prompt, this variable always begins
+        # with a space, followed by the system prompt. When there is no
+        # system prompt, this variable is the empty string.
+        self._system_prompt = ""
+
+    @property
+    def name(self):
+        return self.model.name_or_path
+
+    @property
+    def demonstrations(self) -> Optional[str]:
+        return None if self._demos == "" else self._demos[:-2]
+
+    def set_demonstrations(self, demos: str):
+        self._demos = demos + "\n\n"
+
+    def load_demonstrations(self, filename: str):
+        with open(filename, "r") as f:
+            self.set_demonstrations(f.read())
+
+    def clear_demonstrations(self):
+        self._demos = ""
+
+    @property
+    def system_prompt(self) -> Optional[str]:
+        return None if self._system_prompt == "" else self._system_prompt[1:]
+
+    def set_system_prompt(self, prompt: str):
+        self._system_prompt = " " + prompt
+
+    def clear_system_prompt(self):
+        self._system_prompt = ""
+
+    def _sanitize_parameters(self, **kwargs):
+        """
+        We will not be using this function in this assignment. It is
+        here because it is an abstract method of the Pipeline class,
+        which means we have to implement it even if it does nothing.
+        """
+        return {}, {}, {}
+
+    def _get_input_texts(self, batch: Dict[str, Any]) -> List[str]:
+        """
+        Problem 2c: Implement this function.
+
+        This function takes a batch of TruthfulQA questions and forms
+        the texts that will serve as the input to the LLM. For each
+        answer choice, the corresponding input text consists of the
+        prompt, question, and answer choice concatenated together. Dem-
+        onstrations and system prompts must be included if they are set.
+        Please make sure that your input texts adhere to the format
+        illustrated in the problem set.
+
+        :param batch: A batch of TruthfulQA questions
+        :return: The input texts for each answer choice in the batch.
+            The input texts must appear in order:
+                text 0 corresponds to answer choice 0 for question 0,
+                text 1 corresponds to answer choice 1 for question 0,
+                ...,
+                text 4 corresponds to answer choice 0 for question 1,
+                text 5 corresponds to answer choice 1 for question 1,
+                etc.
+        """
+        
+        input_texts = []
+        for i, one_of_the_questions in enumerate(batch['question']):
+            input_text = ""
+            answers_for_one_question = batch['choices'][i]
+            label_for_one_question = batch['label'][i]
+            for j in range(4):
+                input_text = ""
+                if self._demos != "":
+                    input_text = f"{self._demos}"
+                if self._system_prompt != "":
+                    answers_for_one_question[j] = self._system_prompt + ' '+ batch['choices'][i][j]
+                    
+            # Forming the input text by concatenating prompt, question, and answer choice
+                input_text += f"Q:{one_of_the_questions}\nA:{answers_for_one_question[j]}"
+                input_texts.append(input_text)
+        
+            
+        return input_texts
+        raise NotImplementedError("Problem 2c has not been completed yet!")
+
+
+    def preprocess(self, batch: Dict[str, Any]) -> Dict[str, torch.Tensor]:
+        """
+        Problem 2d: Implement this function.
+
+        This function takes a batch of TruthfulQA questions and turns it
+        into a 🤗 Transformers PyTorch LLM input.
+
+        :param batch: A batch of TruthfulQA questions
+        :return: The LLM input for this batch. The exact contents of the
+            LLM input depend on what model is being used. For most
+            models, the input should contain the input texts represented
+            as a Tensor of vocabulary indices, as well as a Transformer
+            decoder attention mask represented as a Tensor of 0s and 1s.
+            These tensors should be stored on the GPU if it is being
+            used; otherwise, they should be stored on the CPU
+        """
+        input_texts = self._get_input_texts(batch)
+        
+
+        # Tokenize the input texts and convert to tensor
+        inputs = self.tokenizer(input_texts, return_tensors='pt', padding=True, truncation=True)
+
+        return inputs
+        raise NotImplementedError("Problem 2d has not been completed yet!")
+
+    def _forward(self, input_: Dict[str, torch.Tensor]) -> \
+            Dict[str, torch.Tensor]:
+        """
+        Problem 2d: Implement this function.
+
+        This function takes the output of preprocess and feeds it into
+        the pipeline's LLM.
+
+        :param input_: The output of preprocess, which contains an LLM
+            input representing a batch of TruthfulQA questions
+        :return: The logit scores assigned to each next-token prediction
+            as well as the input_ids tensor from input_
+        """
+        
+        with torch.no_grad():
+            outputs = self.model(**input_)
+            logits = outputs.logits
+        return {"input_ids": input_['input_ids'], "logits": logits}
+        raise NotImplementedError("Problem 2d has not been completed yet!")
+
+    def postprocess(self, outputs: Dict[str, torch.Tensor]) -> Output:
+        """
+        Problem 2d: Implement this function.
+
+        This function takes an LLM output, computed by _forward, and for
+        each question in the batch, identifies the answer choice whose
+        corresponding input text had the lowest cross-entropy loss.
+
+        :param outputs: The output of _forward, which contains the next-
+            token prediction logits computed by the pipeline's LLM,
+            along with the vocabulary indices of the input text
+        :return: The predicted answers (0, 1, 2, or 3) for each question
+            in the original batch, along with the total cross-entropy
+            loss incurred by each input text. Make sure your return
+            value is in the form of an Output named tuple, and make sure
+            that the losses are formatted as a matrix, where row i cor-
+            responds to question i and column j corresponds to answer
+            choice j
+        """
+        
+        logits = outputs["logits"]  # Logits for each token prediction
+        input_ids = outputs["input_ids"]  # Input token indices
+
+        total_loss = []
+        # Calculate cross-entropy loss for each answer choice
+        batch_size, seq_length, vocab_size = logits.shape
+        print(batch_size)  #8
+        print(seq_length)  #66
+        print(vocab_size)  #50257
+        
+        for i in range(batch_size):
+            logit_sample = logits[i][:-1] #0...64
+            target = input_ids[i][1:]   #1...65
+            print(logit_sample.shape)
+            print(target.shape)
+            loss = self.loss_fn(logit_sample,target)
+            total_sum = torch.sum(loss)
+            total_loss.append(total_sum)
+        
+        total_loss = torch.tensor(total_loss).reshape(-1,self.num_choices) #2,4
+            
+        min_loss_indices = torch.argmin(total_loss, dim = 1)
+        return Output(loss=total_loss, prediction = min_loss_indices)
+
+        
+        raise NotImplementedError("Problem 2d has not been completed yet!")
+
+
+
+def run_model(pipeline: MultipleChoicePipeline, dataset: Dataset,
+              batch_size: int = 10) -> Output:
+    """
+    Runs a language model on TruthfulQA and returns its predictions and
+    losses.
+    """
+    results = [pipeline(dataset[i:i + batch_size])
+               for i in tqdm(range(0, len(dataset), batch_size))]
+    return Output(*[np.concatenate(r) for r in zip(*results)])
+
+
+def save_outputs(dataset: Dataset, outputs: Output, filename: str,
+                 batch_size: int = 50):
+    """
+    Saves the predictions and losses computed by a language model on
+    TruthfulQA to a CSV file.
+    """
+    with open(filename, "w") as o:
+        writer = csv.writer(o)
+        writer.writerow(["Question", "Choice 0", "Choice 1", "Choice 2",
+                         "Choice 3", "Label", "Prediction", "Loss 0",
+                         "Loss 1", "Loss 2", "Loss 3"])
+
+        for i in tqdm(range(0, len(dataset), batch_size)):
+            batch = dataset[i:i + batch_size]
+
+            q = batch["question"]
+            c1, c2, c3, c4 = zip(*batch["choices"])
+            l_ = batch["label"]
+            p = outputs.prediction
+            l1, l2, l3, l4 = outputs.loss.T
+
+            for row in zip(q, c1, c2, c3, c4, l_, p, l1, l2, l3, l4):
+                writer.writerow(row)
+
+
+def evaluate_truthfulqa(pipeline: MultipleChoicePipeline, dataset: Dataset,
+                        batch_size: int = 10):
+    """
+    Evaluates a pipeline on TruthfulQA.
+    """
+    global accuracy_metric
+
+    # Evaluate the pipeline on TruthfulQA
+    results = run_model(pipeline, dataset, batch_size=batch_size)
+    accuracy = accuracy_metric.compute(predictions=results.prediction,
+                                       references=dataset["label"])
+
+    # Save the results as a csv file
+    model_name = _sanitize(pipeline.name)
+    no_demos = "_no_demos" if pipeline.demonstrations is None else ""
+    system_prompt = "" if pipeline.system_prompt is None else \
+        "_" + _sanitize(pipeline.system_prompt)
+    fn = f"results/{model_name}{no_demos}{system_prompt}_predictions_acc" \
+         f"={accuracy['accuracy']:.3f}.csv"
+    save_outputs(dataset, results, fn)
+
+    return accuracy
+
+
